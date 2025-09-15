@@ -1,0 +1,570 @@
+// try {
+//     const reloader = require('electron-reloader');
+//     reloader(module, {
+//     });
+// } catch (err) {
+// }
+
+require('dotenv').config();
+
+if (require('electron-squirrel-startup')) {
+    process.exit(0);
+}
+
+const { app, BrowserWindow, shell, ipcMain, dialog, desktopCapturer, session } = require('electron');
+const { createWindows } = require('./window/windowManager.js');
+const listenService = require('./features/listen/listenService');
+const databaseInitializer = require('./features/common/services/databaseInitializer');
+const path = require('node:path');
+const { autoUpdater } = require('electron-updater');
+const { EventEmitter } = require('events');
+const askService = require('./features/ask/askService');
+const settingsService = require('./features/settings/settingsService');
+const sessionRepository = require('./features/common/repositories/session');
+const modelStateService = require('./features/common/services/modelStateService');
+const featureBridge = require('./bridge/featureBridge');
+const windowBridge = require('./bridge/windowBridge');
+const stealthService = require('./features/common/services/stealthService'); // Enhanced for AI proctoring evasion
+
+// Global variables
+const eventBridge = new EventEmitter();
+// Removed WEB_PORT
+let isShuttingDown = false; // Flag to prevent infinite shutdown loop
+
+//////// after_modelStateService ////////
+global.modelStateService = modelStateService;
+//////// after_modelStateService ////////
+
+// Import and initialize OllamaService
+const ollamaService = require('./features/common/services/ollamaService');
+const ollamaModelRepository = require('./features/common/repositories/ollamaModel');
+
+// Native deep link handling - cross-platform compatible
+let pendingDeepLinkUrl = null;
+
+function setupProtocolHandling() {
+    // Protocol registration - must be done before app is ready
+    try {
+        if (!app.isDefaultProtocolClient('oacoder')) {
+            const success = app.setAsDefaultProtocolClient('oacoder');
+            if (success) {
+                console.log('[Protocol] Successfully set as default protocol client for oacoder://');
+            } else {
+                console.warn('[Protocol] Failed to set as default protocol client - this may affect deep linking');
+            }
+        } else {
+            console.log('[Protocol] Already registered as default protocol client for oacoder://');
+        }
+    } catch (error) {
+        console.error('[Protocol] Error during protocol registration:', error);
+    }
+
+    // Handle protocol URLs on Windows/Linux
+    app.on('second-instance', (event, commandLine, workingDirectory) => {
+        console.log('[Protocol] Second instance command line:', commandLine);
+        
+        focusMainWindow();
+        
+        let protocolUrl = null;
+        
+        // Search through all command line arguments for a valid protocol URL
+        for (const arg of commandLine) {
+            if (arg && typeof arg === 'string' && arg.startsWith('oacoder://')) {
+                // Clean up the URL by removing problematic characters
+                const cleanUrl = arg.replace(/[\\₩]/g, '');
+                
+                // Additional validation for Windows
+                if (process.platform === 'win32') {
+                    // On Windows, ensure the URL doesn't contain file path indicators
+                    if (!cleanUrl.includes(':') || cleanUrl.indexOf('://') === cleanUrl.lastIndexOf(':')) {
+                        protocolUrl = cleanUrl;
+                        break;
+                    }
+                } else {
+                    protocolUrl = cleanUrl;
+                    break;
+                }
+            }
+        }
+        
+        if (protocolUrl) {
+            console.log('[Protocol] Valid URL found from second instance:', protocolUrl);
+            handleCustomUrl(protocolUrl);
+        } else {
+            console.log('[Protocol] No valid protocol URL found in command line arguments');
+            console.log('[Protocol] Command line args:', commandLine);
+        }
+    });
+
+    // Handle protocol URLs on macOS
+    app.on('open-url', (event, url) => {
+        event.preventDefault();
+        console.log('[Protocol] Received URL via open-url:', url);
+        
+        if (!url || !url.startsWith('oacoder://')) {
+            console.warn('[Protocol] Invalid URL format:', url);
+            return;
+        }
+
+        if (app.isReady()) {
+            handleCustomUrl(url);
+        } else {
+            pendingDeepLinkUrl = url;
+            console.log('[Protocol] App not ready, storing URL for later');
+        }
+    });
+}
+
+function focusMainWindow() {
+    const { windowPool } = require('./window/windowManager.js');
+    if (windowPool) {
+        const header = windowPool.get('header');
+        if (header && !header.isDestroyed()) {
+            if (header.isMinimized()) header.restore();
+            header.focus();
+            return true;
+        }
+    }
+    
+    // Fallback: focus any available window
+    const windows = BrowserWindow.getAllWindows();
+    if (windows.length > 0) {
+        const mainWindow = windows[0];
+        if (!mainWindow.isDestroyed()) {
+            if (mainWindow.isMinimized()) mainWindow.restore();
+            mainWindow.focus();
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+if (process.platform === 'win32') {
+    for (const arg of process.argv) {
+        if (arg && typeof arg === 'string' && arg.startsWith('oacoder://')) {
+            // Clean up the URL by removing problematic characters (korean characters issue...)
+            const cleanUrl = arg.replace(/[\\₩]/g, '');
+            
+            if (!cleanUrl.includes(':') || cleanUrl.indexOf('://') === cleanUrl.lastIndexOf(':')) {
+                console.log('[Protocol] Found protocol URL in initial arguments:', cleanUrl);
+                pendingDeepLinkUrl = cleanUrl;
+                break;
+            }
+        }
+    }
+    
+    console.log('[Protocol] Initial process.argv:', process.argv);
+}
+
+const gotTheLock = app.requestSingleInstanceLock();
+if (!gotTheLock) {
+    app.quit();
+    process.exit(0);
+}
+
+// setup protocol after single instance lock
+setupProtocolHandling();
+
+app.whenReady().then(async () => {
+    // Enhanced for AI proctoring evasion: Randomize process name at startup
+    stealthService.randomizeProcessName();
+
+    // Enhanced for AI proctoring evasion: Check for multi-monitor setup
+    const monitorCheck = stealthService.checkMultiMonitorSetup();
+    if (monitorCheck.hasMultipleMonitors) {
+        console.warn('[Stealth] ' + monitorCheck.warning);
+        // Show warning dialog but don't block startup
+        setTimeout(() => {
+            dialog.showMessageBox({
+                type: 'warning',
+                title: 'Multiple Monitors Detected',
+                message: monitorCheck.warning,
+                buttons: ['OK']
+            });
+        }, 2000);
+    }
+
+    // Setup native loopback audio capture for Windows
+    session.defaultSession.setDisplayMediaRequestHandler((request, callback) => {
+        desktopCapturer.getSources({ types: ['screen'] }).then((sources) => {
+            // Grant access to the first screen found with loopback audio
+            callback({ video: sources[0], audio: 'loopback' });
+        }).catch((error) => {
+            console.error('Failed to get desktop capturer sources:', error);
+            callback({});
+        });
+    });
+
+    // Enhanced for AI proctoring evasion: Apply stealth web preferences
+    const stealthWebPrefs = stealthService.getWebPreferencesForStealth();
+    session.defaultSession.webRequest.onBeforeSendHeaders((details, callback) => {
+        // Remove potentially identifying headers
+        delete details.requestHeaders['User-Agent'];
+        delete details.requestHeaders['Accept-Language'];
+        callback({ requestHeaders: details.requestHeaders });
+    });
+
+    // Initialize core services
+    
+    try {
+        await databaseInitializer.initialize();
+        console.log('>>> [index.js] Database initialized successfully');
+        
+        // Clean up zombie sessions from previous runs
+        await sessionRepository.endAllActiveSessions();
+
+        //////// after_modelStateService ////////
+        await modelStateService.initialize();
+        //////// after_modelStateService ////////
+
+        featureBridge.initialize();  // Added: Initialize featureBridge
+        windowBridge.initialize();
+        setupWebDataHandlers();
+
+        // Initialize Ollama models in database
+        await ollamaModelRepository.initializeDefaultModels();
+
+        // Auto warm-up selected Ollama model in background (non-blocking)
+        setTimeout(async () => {
+            try {
+                console.log('[index.js] Starting background Ollama model warm-up...');
+                await ollamaService.autoWarmUpSelectedModel();
+            } catch (error) {
+                console.log('[index.js] Background warm-up failed (non-critical):', error.message);
+            }
+        }, 2000); // Wait 2 seconds after app start
+
+        // Create windows - no server needed
+        const windowPool = createWindows();
+        
+        // Enhanced for AI proctoring evasion: Initialize stealth service with window pool
+        stealthService.initialize(windowPool);
+
+    } catch (err) {
+        console.error('>>> [index.js] Database initialization failed - some features may not work', err);
+        // Optionally, show an error dialog to the user
+        dialog.showErrorBox(
+            'Application Error',
+            'A critical error occurred during startup. Some features might be disabled. Please restart the application.'
+        );
+    }
+
+    // initAutoUpdater should be called after auth is initialized
+    initAutoUpdater();
+
+    // Process any pending deep link after everything is initialized
+    if (pendingDeepLinkUrl) {
+        console.log('[Protocol] Processing pending URL:', pendingDeepLinkUrl);
+        handleCustomUrl(pendingDeepLinkUrl);
+        pendingDeepLinkUrl = null;
+    }
+});
+
+app.on('before-quit', async (event) => {
+    // Prevent infinite loop by checking if shutdown is already in progress
+    if (isShuttingDown) {
+        console.log('[Shutdown] 🔄 Shutdown already in progress, allowing quit...');
+        return;
+    }
+    
+    console.log('[Shutdown] App is about to quit. Starting graceful shutdown...');
+    
+    // Set shutdown flag to prevent infinite loop
+    isShuttingDown = true;
+    
+    // Prevent immediate quit to allow graceful shutdown
+    event.preventDefault();
+    
+    try {
+        // 1. Stop audio capture first (immediate)
+        await listenService.closeSession();
+        console.log('[Shutdown] Audio capture stopped');
+        
+        // 2. End all active sessions (database operations) - with error handling
+        try {
+            await sessionRepository.endAllActiveSessions();
+            console.log('[Shutdown] Active sessions ended');
+        } catch (dbError) {
+            console.warn('[Shutdown] Could not end active sessions (database may be closed):', dbError.message);
+        }
+        
+        // 3. Shutdown Ollama service (potentially time-consuming)
+        console.log('[Shutdown] shutting down Ollama service...');
+        const ollamaShutdownSuccess = await Promise.race([
+            ollamaService.shutdown(false), // Graceful shutdown
+            new Promise(resolve => setTimeout(() => resolve(false), 8000)) // 8s timeout
+        ]);
+        
+        if (ollamaShutdownSuccess) {
+            console.log('[Shutdown] Ollama service shut down gracefully');
+        } else {
+            console.log('[Shutdown] Ollama shutdown timeout, forcing...');
+            // Force shutdown if graceful failed
+            try {
+                await ollamaService.shutdown(true);
+            } catch (forceShutdownError) {
+                console.warn('[Shutdown] Force shutdown also failed:', forceShutdownError.message);
+            }
+        }
+        
+        // 4. Close database connections (final cleanup)
+        try {
+            databaseInitializer.close();
+            console.log('[Shutdown] Database connections closed');
+        } catch (closeError) {
+            console.warn('[Shutdown] Error closing database:', closeError.message);
+        }
+        
+        console.log('[Shutdown] Graceful shutdown completed successfully');
+        
+    } catch (error) {
+        console.error('[Shutdown] Error during graceful shutdown:', error);
+        // Continue with shutdown even if there were errors
+    } finally {
+        // Actually quit the app now
+        console.log('[Shutdown] Exiting application...');
+        app.exit(0); // Use app.exit() instead of app.quit() to force quit
+    }
+});
+
+app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) {
+        createWindows();
+    }
+});
+
+function setupWebDataHandlers() {
+    const sessionRepository = require('./features/common/repositories/session');
+    const sttRepository = require('./features/listen/stt/repositories');
+    const summaryRepository = require('./features/listen/summary/repositories');
+    const askRepository = require('./features/ask/repositories');
+    const userRepository = require('./features/common/repositories/user');
+    const presetRepository = require('./features/common/repositories/preset');
+
+    const handleRequest = async (channel, responseChannel, payload) => {
+        let result;
+        // const currentUserId = authService.getCurrentUserId(); // No longer needed here
+        try {
+            switch (channel) {
+                // SESSION
+                case 'get-sessions':
+                    // Adapter injects UID
+                    result = await sessionRepository.getAllByUserId();
+                    break;
+                case 'get-session-details':
+                    const session = await sessionRepository.getById(payload);
+                    if (!session) {
+                        result = null;
+                        break;
+                    }
+                    const [transcripts, ai_messages, summary] = await Promise.all([
+                        sttRepository.getAllTranscriptsBySessionId(payload),
+                        askRepository.getAllAiMessagesBySessionId(payload),
+                        summaryRepository.getSummaryBySessionId(payload)
+                    ]);
+                    result = { session, transcripts, ai_messages, summary };
+                    break;
+                case 'delete-session':
+                    result = await sessionRepository.deleteWithRelatedData(payload);
+                    break;
+                case 'create-session':
+                    // Adapter injects UID
+                    const id = await sessionRepository.create('ask');
+                    if (payload && payload.title) {
+                        await sessionRepository.updateTitle(id, payload.title);
+                    }
+                    result = { id };
+                    break;
+                
+                // USER
+                case 'get-user-profile':
+                    // Adapter injects UID
+                    result = await userRepository.getById();
+                    break;
+                case 'update-user-profile':
+                     // Adapter injects UID
+                    result = await userRepository.update(payload);
+                    break;
+                case 'find-or-create-user':
+                    result = await userRepository.findOrCreate(payload);
+                    break;
+                case 'save-api-key':
+                    // Use ModelStateService as the single source of truth for API key management
+                    result = await modelStateService.setApiKey(payload.provider, payload.apiKey);
+                    break;
+                case 'check-api-key-status':
+                    // Use ModelStateService to check API key status
+                    const hasApiKey = await modelStateService.hasValidApiKey();
+                    result = { hasApiKey };
+                    break;
+                case 'delete-account':
+                    // Adapter injects UID
+                    result = await userRepository.deleteById();
+                    break;
+
+                // PRESET
+                case 'get-presets':
+                    // Adapter injects UID
+                    result = await presetRepository.getPresets();
+                    break;
+                case 'create-preset':
+                    // Adapter injects UID
+                    result = await presetRepository.create(payload);
+                    settingsService.notifyPresetUpdate('created', result.id, payload.title);
+                    break;
+                case 'update-preset':
+                    // Adapter injects UID
+                    result = await presetRepository.update(payload.id, payload.data);
+                    settingsService.notifyPresetUpdate('updated', payload.id, payload.data.title);
+                    break;
+                case 'delete-preset':
+                    // Adapter injects UID
+                    result = await presetRepository.delete(payload);
+                    settingsService.notifyPresetUpdate('deleted', payload);
+                    break;
+                
+                // BATCH
+                case 'get-batch-data':
+                    const includes = payload ? payload.split(',').map(item => item.trim()) : ['profile', 'presets', 'sessions'];
+                    const promises = {};
+            
+                    if (includes.includes('profile')) {
+                        // Adapter injects UID
+                        promises.profile = userRepository.getById();
+                    }
+                    if (includes.includes('presets')) {
+                        // Adapter injects UID
+                        promises.presets = presetRepository.getPresets();
+                    }
+                    if (includes.includes('sessions')) {
+                        // Adapter injects UID
+                        promises.sessions = sessionRepository.getAllByUserId();
+                    }
+                    
+                    const batchResult = {};
+                    const promiseResults = await Promise.all(Object.values(promises));
+                    Object.keys(promises).forEach((key, index) => {
+                        batchResult[key] = promiseResults[index];
+                    });
+
+                    result = batchResult;
+                    break;
+
+                default:
+                    throw new Error(`Unknown web data channel: ${channel}`);
+            }
+            eventBridge.emit(responseChannel, { success: true, data: result });
+        } catch (error) {
+            console.error(`Error handling web data request for ${channel}:`, error);
+            eventBridge.emit(responseChannel, { success: false, error: error.message });
+        }
+    };
+    
+    eventBridge.on('web-data-request', handleRequest);
+}
+
+async function handleCustomUrl(url) {
+    try {
+        console.log('[Custom URL] Processing URL:', url);
+        
+        // Validate and clean URL
+        if (!url || typeof url !== 'string' || !url.startsWith('oacoder://')) {
+            console.error('[Custom URL] Invalid URL format:', url);
+            return;
+        }
+        
+        // Clean up URL by removing problematic characters
+        const cleanUrl = url.replace(/[\\₩]/g, '');
+        
+        // Additional validation
+        if (cleanUrl !== url) {
+            console.log('[Custom URL] Cleaned URL from:', url, 'to:', cleanUrl);
+            url = cleanUrl;
+        }
+        
+        const urlObj = new URL(url);
+        const action = urlObj.hostname;
+        const params = Object.fromEntries(urlObj.searchParams);
+        
+        console.log('[Custom URL] Action:', action, 'Params:', params);
+
+        switch (action) {
+            case 'personalize':
+                handlePersonalizeFromUrl(params);
+                break;
+            default:
+                console.log('[Custom URL] Unknown action:', action);
+        }
+
+    } catch (error) {
+        console.error('[Custom URL] Error parsing URL:', error);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+function handlePersonalizeFromUrl(params) {
+    console.log('[Custom URL] Personalize params:', params);
+    
+    const { windowPool } = require('./window/windowManager.js');
+    const header = windowPool.get('header');
+    
+    if (header) {
+        if (header.isMinimized()) header.restore();
+        header.focus();
+        
+        // Removed web navigation
+        
+        BrowserWindow.getAllWindows().forEach(win => {
+            win.webContents.send('enter-personalize-mode', {
+                message: 'Personalization mode activated',
+                params: params
+            });
+        });
+    } else {
+        console.error('[Custom URL] Header window not found for personalize');
+    }
+}
+
+
+// Auto-update initialization
+async function initAutoUpdater() {
+    if (process.env.NODE_ENV === 'development') {
+        console.log('Development environment, skipping auto-updater.');
+        return;
+    }
+
+    try {
+        await autoUpdater.checkForUpdates();
+        autoUpdater.on('update-available', () => {
+            console.log('Update available!');
+            autoUpdater.downloadUpdate();
+        });
+        autoUpdater.on('update-downloaded', (event, releaseNotes, releaseName, date, url) => {
+            console.log('Update downloaded:', releaseNotes, releaseName, date, url);
+            dialog.showMessageBox({
+                type: 'info',
+                title: 'Application Update',
+                message: `A new version of OA Coder (${releaseName}) has been downloaded. It will be installed the next time you launch the application.`,
+                buttons: ['Restart', 'Later']
+            }).then(response => {
+                if (response.response === 0) {
+                    autoUpdater.quitAndInstall();
+                }
+            });
+        });
+        autoUpdater.on('error', (err) => {
+            console.error('Error in auto-updater:', err);
+        });
+    } catch (err) {
+        console.error('Error initializing auto-updater:', err);
+    }
+}

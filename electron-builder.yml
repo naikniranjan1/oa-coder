@@ -1,0 +1,71 @@
+# electron-builder.yml
+
+# The unique application ID
+appId: com.oacoder.app
+
+# The user-facing application name
+productName: OA-Coder
+
+# Publish configuration for GitHub releases
+publish:
+    provider: github
+    owner: oacoder-team
+    repo: oa-coder
+    releaseType: draft
+
+# Protocols configuration for deep linking
+protocols:
+    name: OA-Coder Protocol
+    schemes: 
+        - oacoder
+
+# List of files to be included in the app package
+files:
+    - src/**/*
+    - package.json
+    - '!**/node_modules/electron/**'
+    - '!**/node_modules/@img/**'
+    - '!**/node_modules/electron-liquid-glass/**'
+    - public/build/**/*
+
+# Additional resources to be copied into the app's resources directory
+
+asarUnpack:
+    - "src/ui/assets/SystemAudioDump"
+
+# Windows configuration
+win:
+    icon: src/ui/assets/logo.ico
+    target:
+        - target: nsis
+          arch: x64
+        - target: portable
+          arch: x64
+    requestedExecutionLevel: asInvoker
+
+# NSIS installer configuration for Windows
+nsis:
+    oneClick: false
+    perMachine: false
+    allowToChangeInstallationDirectory: true
+    deleteAppDataOnUninstall: true
+    createDesktopShortcut: always
+    createStartMenuShortcut: true
+    shortcutName: OA-Coder
+
+# macOS specific configuration
+mac:
+    # The application category type
+    category: public.app-category.utilities
+    # Path to the .icns icon file
+    icon: src/ui/assets/logo.icns
+    # Minimum macOS version (supports both Intel and Apple Silicon)
+    minimumSystemVersion: '11.0'
+    hardenedRuntime: true
+    entitlements: entitlements.plist
+    entitlementsInherit: entitlements.plist
+    target:
+      - target: dmg
+        arch: universal
+      - target: zip
+        arch: universal

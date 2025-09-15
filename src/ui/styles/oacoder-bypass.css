@@ -1,0 +1,12 @@
+/*
+  This file disables all animations, transitions, backgrounds, borders, etc.
+  when the body.has-oacoder class is applied to ensure clean transparent effects.
+*/
+body.has-oacoder * {
+    animation: none !important;
+    transition: none !important;
+    background: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+    backdrop-filter: none !important;
+}
