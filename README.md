@@ -141,8 +141,22 @@ npm run build:linux  # Linux
 
 ## 📄 License
 
-GPL-3.0 - See LICENSE file for details.
+MIT License - See [LICENSE](LICENSE) file for details.
+
+## 🤝 Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request. For major changes, please open an issue first to discuss what you would like to change.
+
+## 📞 Support
+
+- 🐛 **Issues**: Report bugs or request features via [GitHub Issues](https://github.com/naikniranjan1/oa-coder/issues)
+- 💬 **Discussions**: Join community discussions on [GitHub Discussions](https://github.com/naikniranjan1/oa-coder/discussions)
+- 📧 **Contact**: For support questions, reach out via GitHub
+
+## ⭐ Star History
+
+If you find OA Coder useful, please consider giving it a star on GitHub!
 
 ---
 
-**Download**: [oacoder.dev](https://oacoder.dev/) | **Documentation**: [docs.oacoder.dev](https://docs.oacoder.dev/)
+**Repository**: [github.com/naikniranjan1/oa-coder](https://github.com/naikniranjan1/oa-coder)
